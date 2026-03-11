@@ -1,3 +1,10 @@
+streamlit
+google-generativeai
+fpdf2
+pandas
+openpyxl
+python-docx
+python-dotenv 
 streamlit>=1.28.0
 google-generativeai>=0.3.0
-pdflatex>=0.1.0
+reportlab>=4.0.0
