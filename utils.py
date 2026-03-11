@@ -4,48 +4,91 @@ import json
 import re
 from pathlib import Path
 import google.generativeai as genai
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak, KeepTogether
+from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_JUSTIFY
+from reportlab.lib.colors import HexColor, white
+from reportlab.platypus.flowables import Flowable
+from reportlab.pdfgen import canvas as pdfcanvas
 from io import BytesIO
 import time
 from typing import Optional, Tuple, Dict, Any, List
 
-# --- NEW IMPORTS ---
-import subprocess
-import tempfile
-import os
+# --- MODERN COLOR PALETTE ---
+COLORS = {
+    # Primary palette (vibrant & professional)
+    "primary": HexColor("#1E88E5"),       # Vibrant blue
+    "primary_dark": HexColor("#1565C0"),  # Darker blue
+    "secondary": HexColor("#26A69A"),     # Teal accent
+    "accent": HexColor("#FF6F00"),        # Orange accent
+    
+    # Text colors
+    "text_dark": HexColor("#212121"),     # Almost black
+    "text_medium": HexColor("#424242"),   # Dark grey
+    "text_light": HexColor("#757575"),    # Medium grey
+    
+    # Background colors
+    "bg_section": HexColor("#E3F2FD"),    # Light blue background
+    "bg_highlight": HexColor("#FFF59D"),  # Yellow highlight
+    "bg_card": HexColor("#FAFAFA"),       # Off-white card
+    
+    # Link color
+    "link": HexColor("#1976D2"),          # Blue link
+}
 
-# --- SYSTEM PROMPT FOR LATEX GENERATION ---
-# This is the new core prompt.
-# THE FIX IS HERE: Note the 'r' before the """
-SYSTEM_PROMPT = r"""
-You are an expert academic typesetter. Your task is to convert a video transcript, provided as JSON segments, into a single, complete, and high-quality LaTeX document.
+# Section icons/emojis
+SECTION_ICONS = {
+    "topic_breakdown": "📚",
+    "key_vocabulary": "📖",
+    "formulas_and_principles": "🔬",
+    "teacher_insights": "💡",
+    "exam_focus_points": "⭐",
+    "common_mistakes_explained": "⚠️",
+    "key_points": "✨",
+    "short_tricks": "⚡",
+    "must_remembers": "🧠"
+}
+
+# --- Configuration and Constants ---
+EXPECTED_KEYS = [
+    "main_subject", "topic_breakdown", "key_vocabulary",
+    "formulas_and_principles", "teacher_insights",
+    "exam_focus_points", "common_mistakes_explained", 
+    "key_points", "short_tricks", "must_remembers" 
+]
+
+# Improved System Prompt
+SYSTEM_PROMPT = """
+You are an expert academic content analyzer. Extract structured study notes from video transcripts.
+
+INPUT FORMAT: JSON array of segments: [{"time": seconds, "text": "content"}]
+
+OUTPUT: Valid JSON object with these exact keys (use snake_case):
+{
+  "main_subject": "Brief subject description",
+  "topic_breakdown": [{"topic": "Name", "details": [{"detail": "Content", "time": 120}]}],
+  "key_vocabulary": [{"term": "Word", "definition": "Meaning", "time": 150}],
+  "formulas_and_principles": [{"formula_or_principle": "Name", "explanation": "Description", "time": 180}],
+  "teacher_insights": [{"insight": "Tip", "time": 210}],
+  "exam_focus_points": [{"point": "Important concept", "time": 240}],
+  "common_mistakes_explained": [{"mistake": "Error", "explanation": "Why it's wrong", "time": 270}],
+  "key_points": [{"text": "Main point", "time": 300}],
+  "short_tricks": [{"text": "Quick method", "time": 330}],
+  "must_remembers": [{"text": "Critical fact", "time": 360}]
+}
 
 RULES:
-1.  **Output Format:** Your response MUST be ONLY raw LaTeX code. It MUST start with `\documentclass{article}` and end with `\end{document}`. Do NOT use markdown code fences (```).
-2.  **Preamble:** You MUST include a robust preamble. Use:
-    - `\documentclass[11pt, a4paper]{article}`
-    - `\usepackage[utf8]{inputenc}`
-    - `\usepackage[T1]{fontenc}`
-    - `\usepackage{amsmath}` (for all math)
-    - `\usepackage{amssymb}`
-    - `\usepackage{booktabs}` (for any tables)
-    - `\usepackage[a4paper, margin=1in]{geometry}` (for page layout)
-    - `\usepackage{hyperref}` (for links)
-    - `\usepackage{graphicx}`
-    - `\usepackage{parskip}` (for better paragraph spacing)
-    - `\usepackage{titlesec}` (for section styling)
-    - `\usepackage{enumitem}` (for lists)
-3.  **Title:** You MUST create a suitable title for the document using the `\title{}` and `\author{}` (e.g., "Notes from Video") commands, and you MUST call `\maketitle` after `\begin{document}`.
-4.  **Content:** You MUST structure the document using `\section{}`, `\subsection{}`, and `\subsubsection{}` based on the `REQUESTED SECTIONS` and the transcript content.
-5.  **Math:** You MUST render all mathematical content using standard LaTeX math environments (e.g., `$..$`, `$$..$$`, `\begin{equation}`, `\begin{align}`). Use `amsmath` features for complex formulas.
-6.  **Timestamps:** If a `video_id` is provided, you MUST hyperlink timestamps.
-    -   Example: `\href{https://www.youtube.com/watch?v=VIDEO_ID&t=123s}{[02:03]}`
-    -   If `video_id` is blank, just write the timestamp as plain text (e.g., `[02:03]`).
-7.  **Lists:** Use `itemize` or `enumerate` for lists (e.g., for Key Points).
-8.  **User Focus:** Pay close attention to the `USER PREFERENCES` prompt.
-9.  **Completeness:** The document MUST be a complete, runnable file. Do NOT use any custom packages or external files.
+1. Use EXACT 'time' values from input (in seconds)
+2. For highlighting mode: Wrap 2-4 critical words in <hl>text</hl> tags
+3. Keep content concise and academic
+4. Return ONLY valid JSON (no markdown, no comments)
+5. Fill ALL requested sections with available content
+6. DO NOT use LaTeX formatting or symbols like $ or $$ for math equations. Use plain text formatting or standard Unicode characters instead.
 """
 
-# --- UTILITY FUNCTIONS (KEPT) ---
+# --- UTILITY FUNCTIONS ---
 
 def inject_custom_css():
     """Modern CSS styling"""
@@ -97,131 +140,375 @@ def extract_gemini_text(response) -> Optional[str]:
             pass
     return None
 
-def preprocess_transcript(text: str) -> List[Dict[str, Any]]:
-    """
-    Parses raw transcript text (with timestamps) into a structured
-    list of segments for the AI.
-    """
-    pattern = r'\[?(\d{1,2}:\d{2}(?::\d{2})?)\]?' 
-    matches = list(re.finditer(pattern, text))
-    segments = []
-    
-    if not matches:
-         if text:
-             return [{"time": "00:00", "text": text.strip()}]
-         return []
-
-    for i in range(len(matches)):
-        start = matches[i].end()
-        end = matches[i+1].start() if i + 1 < len(matches) else len(text)
-        ts_str = matches[i].group(1)
-        
-        # Convert timestamp to seconds for the AI
-        sec = 0
+def extract_clean_json(response_text: str) -> Optional[str]:
+    """Extract JSON from response with markdown cleanup"""
+    cleaned = re.sub(r'```json\s*|\s*```', '', response_text)
+    match = re.search(r'\{.*\}', cleaned, re.DOTALL)
+    if match:
+        json_str = match.group(0)
         try:
-            parts_ts = ts_str.split(':')
-            if len(parts_ts) == 3: # HH:MM:SS
-                sec = int(parts_ts[0])*3600 + int(parts_ts[1])*60 + int(parts_ts[2])
-            elif len(parts_ts) == 2: # MM:SS
-                sec = int(parts_ts[0])*60 + int(parts_ts[1])
-        except ValueError:
-            pass # Keep sec = 0
+            json.loads(json_str)
+            return json_str
+        except json.JSONDecodeError:
+            pass
+    return None
 
-        segments.append({"time": sec, "text": text[start:end].strip()})
-        
-    return segments
+def format_timestamp(seconds: int) -> str:
+    """Convert seconds to [MM:SS] or [HH:MM:SS]"""
+    seconds = int(seconds)
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
+    
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
 
-# --- NEW CORE FUNCTIONS ---
+def get_content_text(item):
+    """Extract text content from various item structures"""
+    if isinstance(item, dict):
+        for key in ['detail', 'explanation', 'point', 'text', 'definition', 
+                    'formula_or_principle', 'insight', 'mistake', 'content']:
+            if key in item and item[key]:
+                return str(item[key])
+    return str(item) if item else ''
 
-def generate_latex_document(
+# --- API INTERACTION ---
+
+@st.cache_data(ttl=0)
+def run_analysis_and_summarize(
     api_key: str, 
     transcript_segments: List[Dict], 
-    sections_list: list, 
+    max_words: int, 
+    sections_list_keys: list, 
     user_prompt: str, 
     model_name: str, 
-    video_id: Optional[str]
-) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Calls Gemini API to generate a complete LaTeX document string.
-    """
+    is_easy_read: bool,
+    pdf_file_obj: Optional[Any] = None
+) -> Tuple[Optional[Dict[str, Any]], Optional[str], str]:
+    """Call Gemini API and return structured JSON"""
     
-    sections_str = ", ".join(sections_list)
-    video_id_str = video_id if video_id else ""
+    sections_str = ", ".join(sections_list_keys)
     
-    prompt_header = f"""
+    highlighting_instruction = (
+        "4. **Highlighting:** Wrap 2-4 critical words in <hl>text</hl> tags."
+        if is_easy_read else
+        "4. **NO special tags:** Use plain text only."
+    )
+    
+    prompt_instructions = SYSTEM_PROMPT + f"""
+{highlighting_instruction}
+5. Target total length: ~{max_words} words across all sections
+6. Extract ONLY these categories: {sections_str}
+
 USER PREFERENCES: {user_prompt}
-REQUESTED SECTIONS: {sections_str}
-VIDEO_ID: {video_id_str}
 """
     
     transcript_json = json.dumps(transcript_segments, indent=2)
-    full_prompt = f"{SYSTEM_PROMPT}\n{prompt_header}\n\nTRANSCRIPT DATA:\n{transcript_json}"
+    full_prompt = f"{prompt_instructions}\n\nTRANSCRIPT DATA:\n{transcript_json}"
     
     if not api_key:
-        return None, "API Key Missing"
+        return None, "API Key Missing", full_prompt
     
     try:
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel(model_name)
         
-        response = model.generate_content(full_prompt)
+        prompt_parts = [full_prompt]
+        if pdf_file_obj:
+            prompt_parts.append(pdf_file_obj)
+
+        response = model.generate_content(prompt_parts)
         response_text = extract_gemini_text(response)
         
         if not response_text:
-            return None, "Empty API response"
+            return None, "Empty API response", full_prompt
         
-        # Basic check to see if it looks like LaTeX
-        if not response_text.strip().startswith(r"\documentclass"):
-            return None, f"AI did not return valid LaTeX. Response: {response_text[:200]}..."
+        print(f"\n{'='*60}")
+        print(f"RAW API RESPONSE (first 800 chars):\n{response_text[:800]}")
+        print(f"{'='*60}\n")
         
-        return response_text, None
+        json_str = extract_clean_json(response_text)
+        if not json_str:
+            return None, f"No valid JSON found in response", full_prompt
         
+        json_data = json.loads(json_str)
+        
+        def to_snake_case(s):
+            s1 = re.sub('(.)([A-Z][a-z]+)', r'\1_\2', s)
+            return re.sub('([a-z0-9])([A-Z])', r'\1_\2', s1).lower()
+        
+        json_data = {to_snake_case(k): v for k, v in json_data.items()}
+        
+        for key in EXPECTED_KEYS:
+            if key not in json_data:
+                json_data[key] = "" if key == "main_subject" else []
+            elif key != "main_subject" and not isinstance(json_data[key], list):
+                json_data[key] = [json_data[key]] if json_data[key] else []
+        
+        print(f"✅ EXTRACTED KEYS: {list(json_data.keys())}")
+        for k, v in json_data.items():
+            if k != "main_subject":
+                print(f"   {k}: {len(v)} items")
+        
+        return json_data, None, full_prompt
+        
+    except json.JSONDecodeError as e:
+        return None, f"JSON Parse Error: {e}", full_prompt
     except Exception as e:
-        return None, f"API Error: {e}"
+        return None, f"API Error: {e}", full_prompt
 
-def compile_latex_to_pdf(latex_string: str) -> Tuple[Optional[bytes], Optional[str]]:
-    """
-    Compiles a LaTeX string into a PDF using pdflatex.
-    Returns (pdf_bytes, error_message)
-    """
-    try:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            base_name = "notes"
-            tex_file_path = os.path.join(temp_dir, f"{base_name}.tex")
-            pdf_file_path = os.path.join(temp_dir, f"{base_name}.pdf")
-            log_file_path = os.path.join(temp_dir, f"{base_name}.log")
+# --- CUSTOM FLOWABLE FOR SECTION HEADER ---
+class SectionHeader(Flowable):
+    """Custom section header with colored background box"""
+    
+    def __init__(self, text, icon="", width=6.5*inch, is_easy_read=False):
+        Flowable.__init__(self)
+        self.text = text
+        self.icon = icon
+        self.width = width
+        self.height = 0.4*inch if is_easy_read else 0.35*inch
+        self.is_easy_read = is_easy_read
+    
+    def draw(self):
+        canvas = self.canv
+        
+        # Draw colored background box
+        canvas.setFillColor(COLORS['primary'])
+        canvas.rect(0, 0, self.width, self.height, fill=1, stroke=0)
+        
+        # Draw text in white
+        canvas.setFillColor(white)
+        canvas.setFont("Helvetica-Bold", 13 if self.is_easy_read else 12)
+        
+        text_with_icon = f"{self.icon} {self.text}" if self.icon else self.text
+        canvas.drawString(12, self.height/2 - 5, text_with_icon)
 
-            # Write the .tex file
-            with open(tex_file_path, 'w', encoding='utf-8') as f:
-                f.write(latex_string)
+# --- CUSTOM PAGE TEMPLATE WITH FOOTER ---
+class NumberedCanvas(pdfcanvas.Canvas):
+    """Canvas with page numbers and footer"""
+    
+    def __init__(self, *args, **kwargs):
+        self.video_title = kwargs.pop('video_title', 'Video Notes')
+        pdfcanvas.Canvas.__init__(self, *args, **kwargs)
+        self._saved_page_states = []
 
-            cmd = ['pdflatex', '-interaction=nonstopmode', '-output-directory', temp_dir, tex_file_path]
-            
-            # --- Run pdflatex ---
-            # We run it up to 2 times. 1st pass for content, 2nd for references (like ToC, if any)
-            
-            log = ""
-            for i in range(2):
-                process = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-                log += f"--- PASS {i+1} ---\nSTDOUT:\n{process.stdout}\nSTDERR:\n{process.stderr}\n"
+    def showPage(self):
+        self._saved_page_states.append(dict(self.__dict__))
+        self._startPage()
+
+    def save(self):
+        num_pages = len(self._saved_page_states)
+        for state in self._saved_page_states:
+            self.__dict__.update(state)
+            self.draw_page_footer(num_pages)
+            pdfcanvas.Canvas.showPage(self)
+        pdfcanvas.Canvas.save(self)
+
+    def draw_page_footer(self, page_count):
+        self.saveState()
+        self.setFont('Helvetica', 8)
+        self.setFillColor(COLORS['text_light'])
+        
+        # Left: Video title
+        self.drawString(0.75*inch, 0.5*inch, self.video_title[:50])
+        
+        # Right: Page number
+        page_num = f"Page {self._pageNumber} of {page_count}"
+        self.drawRightString(letter[0] - 0.75*inch, 0.5*inch, page_num)
+        
+        # Center: App branding
+        self.drawCentredString(letter[0]/2, 0.5*inch, "Generated by AI Notes Generator")
+        
+        self.restoreState()
+
+# --- PDF GENERATION ---
+
+def create_custom_styles(is_easy_read: bool):
+    """Create professional PDF styles with proper spacing"""
+    styles = getSampleStyleSheet()
+    
+    # Title style
+    styles.add(ParagraphStyle(
+        name='CustomTitle',
+        parent=styles['Heading1'],
+        fontSize=26,
+        textColor=COLORS['primary_dark'],
+        spaceAfter=18 if is_easy_read else 12,
+        spaceBefore=6,
+        alignment=TA_CENTER,
+        fontName='Helvetica-Bold'
+    ))
+    
+    # Topic heading (for nested structures)
+    styles.add(ParagraphStyle(
+        name='TopicHead',
+        parent=styles['Normal'],
+        fontSize=11,
+        textColor=COLORS['text_dark'],
+        spaceBefore=10 if is_easy_read else 6,
+        spaceAfter=6 if is_easy_read else 3,
+        fontName='Helvetica-Bold',
+        leftIndent=8
+    ))
+    
+    # Body text - DEFAULT MODE (COMPACT)
+    styles.add(ParagraphStyle(
+        name='CustomBody',
+        parent=styles['Normal'],
+        fontSize=10,
+        textColor=COLORS['text_dark'],
+        leading=14,  # Tight line spacing for default
+        spaceBefore=2,  # Minimal space before
+        spaceAfter=4,   # Minimal space after
+        leftIndent=20,
+        rightIndent=10,
+        fontName='Helvetica'
+    ))
+    
+    # Body text - EASY READ MODE (SPACIOUS)
+    styles.add(ParagraphStyle(
+        name='CustomBodySpacious',
+        parent=styles['Normal'],
+        fontSize=10,
+        textColor=COLORS['text_dark'],
+        leading=18,  # INCREASED line spacing (was 16)
+        spaceBefore=6,  # MORE space before (was 2)
+        spaceAfter=8,   # MORE space after (was 4)
+        leftIndent=20,
+        rightIndent=10,
+        fontName='Helvetica'
+    ))
+    
+    # Timestamp badge style
+    styles.add(ParagraphStyle(
+        name='TimestampBadge',
+        parent=styles['Normal'],
+        fontSize=8,
+        textColor=COLORS['link'],
+        fontName='Helvetica-Bold',
+        alignment=TA_LEFT,
+        backColor=HexColor("#E3F2FD"),
+        borderPadding=2,
+        borderRadius=3
+    ))
+    
+    return styles
+
+def process_highlight_text(text: str, is_easy_read: bool) -> str:
+    """Convert <hl> tags to ReportLab formatting with improved contrast"""
+    if not is_easy_read:
+        return re.sub(r'<hl>(.*?)</hl>', r'\1', text)
+    
+    # Enhanced highlighting: yellow background + bold orange text
+    return re.sub(
+        r'<hl>(.*?)</hl>',
+        r'<span backcolor="#FFF59D" color="#E65100"><b>\1</b></span>',
+        text
+    )
+
+def save_to_pdf(
+    data: dict, 
+    video_id: Optional[str], 
+    font_path: Path, 
+    output: BytesIO, 
+    format_choice: str = "Default (Compact)"
+):
+    """Generate professional PDF with enhanced design and clickable timestamps"""
+    
+    is_easy_read = format_choice.startswith("Easier Read")
+    base_url = f"https://www.youtube.com/watch?v={video_id}" if video_id else None
+    
+    # Get video title for footer
+    video_title = data.get("main_subject", "Video Study Notes")
+    
+    # Create PDF with custom canvas (for footer)
+    doc = SimpleDocTemplate(
+        output,
+        pagesize=letter,
+        rightMargin=0.75*inch,
+        leftMargin=0.75*inch,
+        topMargin=0.75*inch,
+        bottomMargin=0.75*inch,
+        title=video_title
+    )
+    
+    story = []
+    styles = create_custom_styles(is_easy_read)
+    body_style = styles['CustomBodySpacious'] if is_easy_read else styles['CustomBody']
+    
+    # Title
+    story.append(Spacer(1, 0.1*inch))
+    story.append(Paragraph(video_title, styles['CustomTitle']))
+    story.append(Spacer(1, 0.25*inch if is_easy_read else 0.15*inch))
+    
+    # Process each section
+    for section_key, section_content in data.items():
+        if section_key == "main_subject" or not isinstance(section_content, list) or not section_content:
+            continue
+        
+        heading = section_key.replace("_", " ").title()
+        icon = SECTION_ICONS.get(section_key, "📌")
+        
+        story.append(SectionHeader(heading, icon, is_easy_read=is_easy_read))
+        story.append(Spacer(1, 0.15*inch if is_easy_read else 0.1*inch))
+        
+        # --- Nested Topic Breakdown ---
+        if section_key == 'topic_breakdown':
+            for item in section_content:
+                topic_name = item.get('topic', '')
+                if topic_name:
+                    story.append(Paragraph(f"• {topic_name}", styles['TopicHead']))
                 
-                # If PDF doesn't exist after first pass, it failed
-                if i == 0 and not os.path.exists(pdf_file_path):
-                    with open(log_file_path, 'r', encoding='utf-8', errors='ignore') as log_f:
-                        log_details = log_f.read()
-                    return None, f"LaTeX Compilation Failed. Check .tex file.\nError Log:\n{log_details[-1000:]}"
+                for detail in item.get('details', []):
+                    detail_text = get_content_text(detail)
+                    if not detail_text.strip():
+                        continue
+                    
+                    formatted_text = process_highlight_text(detail_text, is_easy_read)
+                    
+                    timestamp = detail.get('time')
+                    if timestamp and base_url:
+                        link_url = f"{base_url}&t={int(timestamp)}s"
+                        ts_formatted = format_timestamp(int(timestamp))
+                        # ✅ clickable timestamp
+                        formatted_text += (
+                            f' <a href="{link_url}" color="#1976D2">'
+                            f'<font size="8"><b>[{ts_formatted}]</b></font></a>'
+                        )
+                    
+                    story.append(Paragraph(formatted_text, body_style))
             
-            # If PDF exists, read it
-            if os.path.exists(pdf_file_path):
-                with open(pdf_file_path, 'rb') as f:
-                    pdf_bytes = f.read()
-                return pdf_bytes, None
-            else:
-                return None, f"Compilation finished, but no PDF was created. Log:\n{log}"
-
-    except FileNotFoundError:
-        return None, "Error: 'pdflatex' command not found. Is TeX Live or MiKTeX installed and in your system's PATH?"
-    except subprocess.TimeoutExpired:
-        return None, "Error: LaTeX compilation timed out (120s). The .tex file may be too complex or in an infinite loop."
-    except Exception as e:
-        return None, f"An unknown error occurred during compilation: {e}"
+            story.append(Spacer(1, 0.2*inch if is_easy_read else 0.12*inch))
+            continue
+        
+        # --- Flat Sections ---
+        for item in section_content:
+            content_text = get_content_text(item)
+            if not content_text.strip():
+                continue
+            
+            formatted_text = process_highlight_text(content_text, is_easy_read)
+            
+            timestamp = item.get('time') if isinstance(item, dict) else None
+            if timestamp and base_url:
+                link_url = f"{base_url}&t={int(timestamp)}s"
+                ts_formatted = format_timestamp(int(timestamp))
+                # ✅ clickable timestamp
+                formatted_text += (
+                    f' <a href="{link_url}" color="#1976D2">'
+                    f'<font size="8"><b>[{ts_formatted}]</b></font></a>'
+                )
+            
+            story.append(Paragraph(f"• {formatted_text}", body_style))
+        
+        story.append(Spacer(1, 0.2*inch if is_easy_read else 0.12*inch))
+    
+    # Build PDF with custom canvas
+    doc.build(
+        story,
+        canvasmaker=lambda *args, **kwargs: NumberedCanvas(*args, video_title=video_title, **kwargs)
+    )
+    output.seek(0)
+    
+    print(f"\n✅ PDF generated successfully ({len(story)} elements, Easy Read: {is_easy_read}, Clickable timestamps enabled)")
